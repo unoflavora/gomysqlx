@@ -180,14 +180,14 @@ func (p *Parser) parseDeleteStatement() (ast.Statement, error) {
 			}
 		}
 
-		// More target tables
+		// More target aliases (these are just alias references, not real table names)
 		for p.isType(models.TokenTypeComma) {
 			p.advance()
-			ref, err := p.parseFromTableReference()
+			// Parse but don't add to using — these are aliases, real tables come from FROM
+			_, err := p.parseFromTableReference()
 			if err != nil {
 				return nil, err
 			}
-			using = append(using, ref)
 			// Handle .*
 			if p.isType(models.TokenTypeDot) {
 				p.advance()
