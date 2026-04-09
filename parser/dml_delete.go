@@ -209,6 +209,8 @@ func (p *Parser) parseDeleteStatement() (ast.Statement, error) {
 			return nil, err
 		}
 		using = append(using, ref)
+		// For multi-table DELETE, set tableName to the first real table from FROM clause
+		tableName = ref.Name
 		for p.isType(models.TokenTypeComma) {
 			p.advance()
 			ref, err := p.parseFromTableReference()
