@@ -1,0 +1,380 @@
+// Copyright 2026 GoSQLX Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package parser
+
+import (
+	"testing"
+
+	"github.com/unoflavora/gomysqlx/ast"
+	"github.com/unoflavora/gomysqlx/tokenizer"
+)
+
+func TestParser_SimpleCTE(t *testing.T) {
+	sql := `WITH test_cte AS (SELECT name FROM users) SELECT name FROM test_cte`
+
+	// Get tokenizer from pool
+	tkz := tokenizer.GetTokenizer()
+	defer tokenizer.PutTokenizer(tkz)
+
+	// Tokenize SQL
+	tokens, err := tkz.Tokenize([]byte(sql))
+	if err != nil {
+		t.Fatalf("Failed to tokenize: %v", err)
+	}
+
+	// Convert tokens for parser
+
+	// Parse tokens
+	parser := &Parser{}
+	astObj, err := parser.ParseFromModelTokens(tokens)
+	if err != nil {
+		t.Fatalf("Failed to parse CTE: %v", err)
+	}
+	defer ast.ReleaseAST(astObj)
+
+	// Verify we have a SELECT statement
+	if len(astObj.Statements) == 0 {
+		t.Fatal("No statements parsed")
+	}
+
+	selectStmt, ok := astObj.Statements[0].(*ast.SelectStatement)
+	if !ok {
+		t.Fatal("Expected SELECT statement")
+	}
+
+	// Verify WITH clause exists
+	if selectStmt.With == nil {
+		t.Fatal("Expected WITH clause")
+	}
+
+	// Verify not recursive
+	if selectStmt.With.Recursive {
+		t.Error("Expected non-recursive CTE")
+	}
+
+	// Verify one CTE
+	if len(selectStmt.With.CTEs) != 1 {
+		t.Errorf("Expected 1 CTE, got %d", len(selectStmt.With.CTEs))
+	}
+
+	// Verify CTE details
+	if len(selectStmt.With.CTEs) > 0 {
+		cte := selectStmt.With.CTEs[0]
+		if cte.Name != "test_cte" {
+			t.Errorf("Expected CTE name 'test_cte', got '%s'", cte.Name)
+		}
+
+		// Verify CTE statement is a SELECT
+		_, ok := cte.Statement.(*ast.SelectStatement)
+		if !ok {
+			t.Errorf("Expected CTE statement to be SELECT, got %T", cte.Statement)
+		}
+	}
+}
+
+func TestParser_RecursiveCTE(t *testing.T) {
+	sql := `WITH RECURSIVE cte AS (
+		SELECT 1 AS n
+		UNION ALL
+		SELECT n + 1 FROM cte WHERE n < 10
+	) SELECT * FROM cte`
+
+	// Get tokenizer from pool
+	tkz := tokenizer.GetTokenizer()
+	defer tokenizer.PutTokenizer(tkz)
+
+	// Tokenize SQL
+	tokens, err := tkz.Tokenize([]byte(sql))
+	if err != nil {
+		t.Fatalf("Failed to tokenize: %v", err)
+	}
+
+	// Convert tokens for parser using standard converter
+
+	// Parse tokens
+	parser := &Parser{}
+	astObj, err := parser.ParseFromModelTokens(tokens)
+	if err != nil {
+		t.Fatalf("Failed to parse recursive CTE with UNION ALL: %v", err)
+	}
+	defer ast.ReleaseAST(astObj)
+
+	// Verify we have a SELECT statement
+	if len(astObj.Statements) == 0 {
+		t.Fatal("No statements parsed")
+	}
+
+	selectStmt, ok := astObj.Statements[0].(*ast.SelectStatement)
+	if !ok {
+		t.Fatal("Expected SELECT statement")
+	}
+
+	// Verify WITH clause exists
+	if selectStmt.With == nil {
+		t.Fatal("Expected WITH clause")
+	}
+
+	// Verify recursive
+	if !selectStmt.With.Recursive {
+		t.Error("Expected recursive CTE")
+	}
+
+	// Verify one CTE
+	if len(selectStmt.With.CTEs) != 1 {
+		t.Errorf("Expected 1 CTE, got %d", len(selectStmt.With.CTEs))
+	}
+
+	// Verify CTE details
+	if len(selectStmt.With.CTEs) > 0 {
+		cte := selectStmt.With.CTEs[0]
+		if cte.Name != "cte" {
+			t.Errorf("Expected CTE name 'cte', got '%s'", cte.Name)
+		}
+
+		// Verify the CTE statement is a SetOperation (UNION ALL)
+		setOp, ok := cte.Statement.(*ast.SetOperation)
+		if !ok {
+			t.Fatalf("Expected SetOperation in CTE body, got %T", cte.Statement)
+		}
+
+		// Verify it's UNION ALL
+		if setOp.Operator != "UNION" {
+			t.Errorf("Expected UNION operator, got %s", setOp.Operator)
+		}
+		if !setOp.All {
+			t.Error("Expected UNION ALL (All flag should be true)")
+		}
+
+		// Verify left side is SELECT 1 AS n
+		leftSelect, ok := setOp.Left.(*ast.SelectStatement)
+		if !ok {
+			t.Fatalf("Expected left side to be SelectStatement, got %T", setOp.Left)
+		}
+		if len(leftSelect.Columns) != 1 {
+			t.Errorf("Expected 1 column in left SELECT, got %d", len(leftSelect.Columns))
+		}
+
+		// Verify right side is SELECT n + 1 FROM cte WHERE n < 10
+		rightSelect, ok := setOp.Right.(*ast.SelectStatement)
+		if !ok {
+			t.Fatalf("Expected right side to be SelectStatement, got %T", setOp.Right)
+		}
+		if len(rightSelect.Columns) != 1 {
+			t.Errorf("Expected 1 column in right SELECT, got %d", len(rightSelect.Columns))
+		}
+		if rightSelect.Where == nil {
+			t.Error("Expected WHERE clause in right SELECT")
+		}
+	}
+}
+
+func TestParser_MultipleCTEs(t *testing.T) {
+	sql := `WITH first_cte AS (SELECT region FROM sales), second_cte AS (SELECT region FROM first_cte) SELECT region FROM second_cte`
+
+	// Get tokenizer from pool
+	tkz := tokenizer.GetTokenizer()
+	defer tokenizer.PutTokenizer(tkz)
+
+	// Tokenize SQL
+	tokens, err := tkz.Tokenize([]byte(sql))
+	if err != nil {
+		t.Fatalf("Failed to tokenize: %v", err)
+	}
+
+	// Convert tokens for parser
+
+	// Parse tokens
+	parser := &Parser{}
+	astObj, err := parser.ParseFromModelTokens(tokens)
+	if err != nil {
+		t.Fatalf("Failed to parse multiple CTEs: %v", err)
+	}
+	defer ast.ReleaseAST(astObj)
+
+	// Verify we have a SELECT statement
+	if len(astObj.Statements) == 0 {
+		t.Fatal("No statements parsed")
+	}
+
+	selectStmt, ok := astObj.Statements[0].(*ast.SelectStatement)
+	if !ok {
+		t.Fatal("Expected SELECT statement")
+	}
+
+	// Verify WITH clause exists
+	if selectStmt.With == nil {
+		t.Fatal("Expected WITH clause")
+	}
+
+	// Verify two CTEs
+	if len(selectStmt.With.CTEs) != 2 {
+		t.Errorf("Expected 2 CTEs, got %d", len(selectStmt.With.CTEs))
+	}
+
+	// Verify CTE names
+	expectedNames := []string{"first_cte", "second_cte"}
+	for i, expectedName := range expectedNames {
+		if i < len(selectStmt.With.CTEs) {
+			if selectStmt.With.CTEs[i].Name != expectedName {
+				t.Errorf("CTE %d: expected name '%s', got '%s'", i, expectedName, selectStmt.With.CTEs[i].Name)
+			}
+		}
+	}
+}
+
+func TestParser_CTEWithColumns(t *testing.T) {
+	sql := `WITH sales_summary(region, total, avg_sale) AS (SELECT region, amount, amount FROM sales) SELECT region FROM sales_summary`
+
+	// Get tokenizer from pool
+	tkz := tokenizer.GetTokenizer()
+	defer tokenizer.PutTokenizer(tkz)
+
+	// Tokenize SQL
+	tokens, err := tkz.Tokenize([]byte(sql))
+	if err != nil {
+		t.Fatalf("Failed to tokenize: %v", err)
+	}
+
+	// Convert tokens for parser
+
+	// Parse tokens
+	parser := &Parser{}
+	astObj, err := parser.ParseFromModelTokens(tokens)
+	if err != nil {
+		t.Fatalf("Failed to parse CTE with columns: %v", err)
+	}
+	defer ast.ReleaseAST(astObj)
+
+	// Verify we have a SELECT statement
+	if len(astObj.Statements) == 0 {
+		t.Fatal("No statements parsed")
+	}
+
+	selectStmt, ok := astObj.Statements[0].(*ast.SelectStatement)
+	if !ok {
+		t.Fatal("Expected SELECT statement")
+	}
+
+	// Verify WITH clause exists
+	if selectStmt.With == nil {
+		t.Fatal("Expected WITH clause")
+	}
+
+	// Verify CTE has columns
+	if len(selectStmt.With.CTEs) > 0 {
+		cte := selectStmt.With.CTEs[0]
+		if cte.Name != "sales_summary" {
+			t.Errorf("Expected CTE name 'sales_summary', got '%s'", cte.Name)
+		}
+
+		expectedColumns := []string{"region", "total", "avg_sale"}
+		if len(cte.Columns) != len(expectedColumns) {
+			t.Errorf("Expected %d columns, got %d", len(expectedColumns), len(cte.Columns))
+		}
+
+		for i, expectedCol := range expectedColumns {
+			if i < len(cte.Columns) {
+				if cte.Columns[i] != expectedCol {
+					t.Errorf("Column %d: expected '%s', got '%s'", i, expectedCol, cte.Columns[i])
+				}
+			}
+		}
+	}
+}
+
+func TestParser_MaterializedCTE(t *testing.T) {
+	tests := []struct {
+		name         string
+		sql          string
+		materialized *bool // nil = not specified, true = MATERIALIZED, false = NOT MATERIALIZED
+	}{
+		{
+			name:         "MATERIALIZED CTE",
+			sql:          `WITH cached_data AS MATERIALIZED (SELECT name FROM users) SELECT name FROM cached_data`,
+			materialized: boolPtr(true),
+		},
+		{
+			name:         "NOT MATERIALIZED CTE",
+			sql:          `WITH inline_data AS NOT MATERIALIZED (SELECT name FROM users) SELECT name FROM inline_data`,
+			materialized: boolPtr(false),
+		},
+		{
+			name:         "Default CTE (no materialization hint)",
+			sql:          `WITH default_data AS (SELECT name FROM users) SELECT name FROM default_data`,
+			materialized: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Get tokenizer from pool
+			tkz := tokenizer.GetTokenizer()
+			defer tokenizer.PutTokenizer(tkz)
+
+			// Tokenize SQL
+			tokens, err := tkz.Tokenize([]byte(tt.sql))
+			if err != nil {
+				t.Fatalf("Failed to tokenize: %v", err)
+			}
+
+			// Convert tokens for parser
+
+			// Parse tokens
+			parser := &Parser{}
+			astObj, err := parser.ParseFromModelTokens(tokens)
+			if err != nil {
+				t.Fatalf("Failed to parse CTE: %v", err)
+			}
+			defer ast.ReleaseAST(astObj)
+
+			// Verify we have a SELECT statement
+			if len(astObj.Statements) == 0 {
+				t.Fatal("No statements parsed")
+			}
+
+			selectStmt, ok := astObj.Statements[0].(*ast.SelectStatement)
+			if !ok {
+				t.Fatal("Expected SELECT statement")
+			}
+
+			// Verify WITH clause exists
+			if selectStmt.With == nil {
+				t.Fatal("Expected WITH clause")
+			}
+
+			// Verify one CTE
+			if len(selectStmt.With.CTEs) != 1 {
+				t.Fatalf("Expected 1 CTE, got %d", len(selectStmt.With.CTEs))
+			}
+
+			cte := selectStmt.With.CTEs[0]
+
+			// Verify materialized flag
+			if tt.materialized == nil {
+				if cte.Materialized != nil {
+					t.Errorf("Expected nil Materialized, got %v", *cte.Materialized)
+				}
+			} else {
+				if cte.Materialized == nil {
+					t.Errorf("Expected Materialized=%v, got nil", *tt.materialized)
+				} else if *cte.Materialized != *tt.materialized {
+					t.Errorf("Expected Materialized=%v, got %v", *tt.materialized, *cte.Materialized)
+				}
+			}
+		})
+	}
+}
+
+// Note: boolPtr helper is defined in ddl_test.go

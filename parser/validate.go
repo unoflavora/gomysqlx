@@ -1,0 +1,216 @@
+// Copyright 2026 GoSQLX Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Validate() implements a fast path for SQL validation without full AST construction.
+// See issue #274.
+package parser
+
+import (
+	"fmt"
+	"strings"
+
+	goerrors "github.com/unoflavora/gomysqlx/errors"
+	"github.com/unoflavora/gomysqlx/models"
+	"github.com/unoflavora/gomysqlx/ast"
+	"github.com/unoflavora/gomysqlx/keywords"
+	"github.com/unoflavora/gomysqlx/tokenizer"
+)
+
+// Validate checks whether the given SQL string is syntactically valid without
+// building a full AST. It tokenizes the input and runs the parser, but the
+// returned AST is immediately released. This is significantly faster than
+// Parse() when you only need to know if the SQL is valid.
+func Validate(sql string) error {
+	return ValidateBytes([]byte(sql))
+}
+
+// ValidateBytes is like Validate but accepts []byte to avoid a string copy.
+func ValidateBytes(input []byte) error {
+	// Fast path: empty/whitespace-only input is valid
+	if len(trimBytes(input)) == 0 {
+		return nil
+	}
+
+	tkz := tokenizer.GetTokenizer()
+	defer tokenizer.PutTokenizer(tkz)
+
+	tokens, err := tkz.Tokenize(input)
+	if err != nil {
+		return fmt.Errorf("tokenization error: %w", err)
+	}
+
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	p := GetParser()
+	defer PutParser(p)
+
+	astResult, parseErr := p.ParseFromModelTokens(tokens)
+	if parseErr != nil {
+		return parseErr
+	}
+	ast.ReleaseAST(astResult)
+	return nil
+}
+
+// trimBytes returns input with leading/trailing whitespace removed.
+func trimBytes(b []byte) []byte {
+	start, end := 0, len(b)
+	for start < end && (b[start] == ' ' || b[start] == '\t' || b[start] == '\n' || b[start] == '\r') {
+		start++
+	}
+	for end > start && (b[end-1] == ' ' || b[end-1] == '\t' || b[end-1] == '\n' || b[end-1] == '\r') {
+		end--
+	}
+	return b[start:end]
+}
+
+// validDialectList returns a human-readable comma-separated list of all valid
+// dialect names for use in error messages.
+func validDialectList() string {
+	dialects := keywords.AllDialects()
+	names := make([]string, 0, len(dialects))
+	for _, d := range dialects {
+		// Belt-and-suspenders: DialectUnknown is not in AllDialects(), but guard
+		// here in case a future refactor inadvertently adds it back.
+		if d != keywords.DialectUnknown {
+			names = append(names, string(d))
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+// ParseBytes parses SQL from a []byte input without requiring a string conversion.
+// This is especially useful when reading SQL from files via os.ReadFile.
+// See issue #277.
+func ParseBytes(input []byte) (*ast.AST, error) {
+	tkz := tokenizer.GetTokenizer()
+	defer tokenizer.PutTokenizer(tkz)
+
+	tokens, err := tkz.Tokenize(input)
+	if err != nil {
+		return nil, fmt.Errorf("tokenization error: %w", err)
+	}
+
+	if len(tokens) == 0 {
+		return nil, goerrors.IncompleteStatementError(models.Location{}, "")
+	}
+
+	p := GetParser()
+	defer PutParser(p)
+
+	return p.ParseFromModelTokens(tokens)
+}
+
+// ParseBytesWithTokens is like ParseBytes but also returns the preprocessed
+// token slice ([]models.TokenWithSpan) for callers that need both.
+func ParseBytesWithTokens(input []byte) (*ast.AST, []models.TokenWithSpan, error) {
+	tkz := tokenizer.GetTokenizer()
+	defer tokenizer.PutTokenizer(tkz)
+
+	tokens, err := tkz.Tokenize(input)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tokenization error: %w", err)
+	}
+
+	if len(tokens) == 0 {
+		return nil, nil, goerrors.IncompleteStatementError(models.Location{}, "")
+	}
+
+	p := GetParser()
+	defer PutParser(p)
+
+	preprocessed := preprocessTokens(tokens)
+	astResult, parseErr := p.parseTokens(preprocessed)
+	if parseErr != nil {
+		return nil, nil, parseErr
+	}
+
+	return astResult, preprocessed, nil
+}
+
+// ValidateWithDialect checks whether the given SQL string is syntactically valid
+// using the specified SQL dialect for keyword recognition.
+func ValidateWithDialect(sql string, dialect keywords.SQLDialect) error {
+	return ValidateBytesWithDialect([]byte(sql), dialect)
+}
+
+// ValidateBytesWithDialect is like ValidateWithDialect but accepts []byte.
+func ValidateBytesWithDialect(input []byte, dialect keywords.SQLDialect) error {
+	if len(trimBytes(input)) == 0 {
+		return nil
+	}
+
+	if !keywords.IsValidDialect(string(dialect)) {
+		return fmt.Errorf("unknown SQL dialect %q; valid dialects: %s",
+			dialect, validDialectList())
+	}
+
+	tkz, err := tokenizer.NewWithDialect(dialect)
+	if err != nil {
+		return fmt.Errorf("tokenizer initialization: %w", err)
+	}
+
+	tokens, err := tkz.Tokenize(input)
+	if err != nil {
+		return fmt.Errorf("tokenization error: %w", err)
+	}
+
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	p := NewParser(WithDialect(string(dialect)))
+	defer p.Release()
+
+	astResult, parseErr := p.ParseFromModelTokens(tokens)
+	if parseErr != nil {
+		return parseErr
+	}
+	ast.ReleaseAST(astResult)
+	return nil
+}
+
+// ParseWithDialect parses SQL using the specified dialect for keyword recognition.
+// This is a convenience function combining dialect-aware tokenization and parsing.
+func ParseWithDialect(sql string, dialect keywords.SQLDialect) (*ast.AST, error) {
+	return ParseBytesWithDialect([]byte(sql), dialect)
+}
+
+// ParseBytesWithDialect is like ParseWithDialect but accepts []byte.
+func ParseBytesWithDialect(input []byte, dialect keywords.SQLDialect) (*ast.AST, error) {
+	if !keywords.IsValidDialect(string(dialect)) {
+		return nil, fmt.Errorf("unknown SQL dialect %q; valid dialects: %s",
+			dialect, validDialectList())
+	}
+
+	tkz, err := tokenizer.NewWithDialect(dialect)
+	if err != nil {
+		return nil, fmt.Errorf("tokenizer initialization: %w", err)
+	}
+
+	tokens, err := tkz.Tokenize(input)
+	if err != nil {
+		return nil, fmt.Errorf("tokenization error: %w", err)
+	}
+
+	if len(tokens) == 0 {
+		return nil, goerrors.IncompleteStatementError(models.Location{}, "")
+	}
+
+	p := NewParser(WithDialect(string(dialect)))
+
+	return p.ParseFromModelTokens(tokens)
+}

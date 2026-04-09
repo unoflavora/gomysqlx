@@ -1,0 +1,161 @@
+// Copyright 2026 GoSQLX Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package tokenizer
+
+import (
+	"testing"
+
+	"github.com/unoflavora/gomysqlx/models"
+)
+
+func TestTokenizer_Operators(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected []struct {
+			tokenType models.TokenType
+			value     string
+		}
+	}{
+		{
+			input: "a + b * c / d % e",
+			expected: []struct {
+				tokenType models.TokenType
+				value     string
+			}{
+				{models.TokenTypeIdentifier, "a"},
+				{models.TokenTypePlus, "+"},
+				{models.TokenTypeIdentifier, "b"},
+				{models.TokenTypeMul, "*"},
+				{models.TokenTypeIdentifier, "c"},
+				{models.TokenTypeDiv, "/"},
+				{models.TokenTypeIdentifier, "d"},
+				{models.TokenTypeMod, "%"},
+				{models.TokenTypeIdentifier, "e"},
+			},
+		},
+		{
+			input: "x || y",
+			expected: []struct {
+				tokenType models.TokenType
+				value     string
+			}{
+				{models.TokenTypeIdentifier, "x"},
+				{models.TokenTypeStringConcat, "||"},
+				{models.TokenTypeIdentifier, "y"},
+			},
+		},
+		{
+			input: "data->>'field'",
+			expected: []struct {
+				tokenType models.TokenType
+				value     string
+			}{
+				{models.TokenTypeIdentifier, "data"},
+				{models.TokenTypeLongArrow, "->>"},
+				{models.TokenTypeSingleQuotedString, "field"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		tokenizer, err := New()
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		tokens, err := tokenizer.Tokenize([]byte(test.input))
+		if err != nil {
+			t.Fatalf("Tokenize() error = %v", err)
+		}
+		if len(tokens)-1 != len(test.expected) { // -1 for EOF
+			t.Logf("Tokens for %q:", test.input)
+			for i, token := range tokens {
+				if i < len(tokens)-1 { // Skip EOF
+					t.Logf("Token %d: Type=%v, Value=%q", i, token.Token.Type, token.Token.Value)
+				}
+			}
+			t.Fatalf("wrong number of tokens for %q, got %d, expected %d", test.input, len(tokens)-1, len(test.expected))
+		}
+		for i, exp := range test.expected {
+			if tokens[i].Token.Type != exp.tokenType {
+				t.Errorf("wrong type for token %d in %q, got %v, expected %v", i, test.input, tokens[i].Token.Type, exp.tokenType)
+			}
+			if tokens[i].Token.Value != exp.value {
+				t.Errorf("wrong value for token %d in %q, got %v, expected %v", i, test.input, tokens[i].Token.Value, exp.value)
+			}
+		}
+	}
+}
+
+func TestTokenizer_SpecialOperators(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected []struct {
+			tokenType models.TokenType
+			value     string
+		}
+	}{
+		{
+			input: "x::text",
+			expected: []struct {
+				tokenType models.TokenType
+				value     string
+			}{
+				{models.TokenTypeIdentifier, "x"},
+				{models.TokenTypeDoubleColon, "::"},
+				{models.TokenTypeIdentifier, "text"},
+			},
+		},
+		{
+			input: "data=>>'field'",
+			expected: []struct {
+				tokenType models.TokenType
+				value     string
+			}{
+				{models.TokenTypeIdentifier, "data"},
+				{models.TokenTypeRArrow, "=>"},
+				{models.TokenTypeGt, ">"},
+				{models.TokenTypeSingleQuotedString, "field"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		tokenizer, err := New()
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		tokens, err := tokenizer.Tokenize([]byte(test.input))
+		if err != nil {
+			t.Fatalf("Tokenize() error = %v", err)
+		}
+		if len(tokens)-1 != len(test.expected) { // -1 for EOF
+			t.Logf("Tokens for %q:", test.input)
+			for i, token := range tokens {
+				if i < len(tokens)-1 { // Skip EOF
+					t.Logf("Token %d: Type=%v, Value=%q", i, token.Token.Type, token.Token.Value)
+				}
+			}
+			t.Fatalf("wrong number of tokens for %q, got %d, expected %d", test.input, len(tokens)-1, len(test.expected))
+		}
+		for i, exp := range test.expected {
+			if tokens[i].Token.Type != exp.tokenType {
+				t.Errorf("wrong type for token %d in %q, got %v, expected %v", i, test.input, tokens[i].Token.Type, exp.tokenType)
+			}
+			if tokens[i].Token.Value != exp.value {
+				t.Errorf("wrong value for token %d in %q, got %v, expected %v", i, test.input, tokens[i].Token.Value, exp.value)
+			}
+		}
+	}
+}
