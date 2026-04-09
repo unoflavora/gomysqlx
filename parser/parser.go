@@ -649,9 +649,22 @@ func (p *Parser) parseStatement() (ast.Statement, error) {
 	case models.TokenTypeShow:
 		p.advance()
 		return p.parseShowStatement()
-	case models.TokenTypeDescribe, models.TokenTypeExplain:
+	case models.TokenTypeDescribe, models.TokenTypeExplain, models.TokenTypeDesc:
 		p.advance()
 		return p.parseDescribeStatement()
+	case models.TokenTypeValues:
+		// MySQL 8.0.19+: VALUES ROW(1, 'a'), ROW(2, 'b')
+		// Treat as a SELECT-like statement that returns rows
+		p.advance() // Consume VALUES
+		return p.parseValuesStatement()
+	case models.TokenTypeTable:
+		// MySQL 8.0.19+: TABLE users ≡ SELECT * FROM users
+		p.advance() // Consume TABLE
+		return p.parseTableStatement()
+	case models.TokenTypeLParen:
+		// Parenthesized query: (SELECT ...) ORDER BY ... LIMIT ...
+		// or (SELECT ...) UNION ALL (SELECT ...)
+		return p.parseParenthesizedQuery()
 	case models.TokenTypeReplace:
 		p.advance()
 		return p.parseReplaceStatement()
