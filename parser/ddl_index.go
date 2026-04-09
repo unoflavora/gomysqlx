@@ -78,14 +78,46 @@ func (p *Parser) parseCreateIndex(unique bool) (*ast.CreateIndexStatement, error
 	}
 	p.advance() // Consume (
 
-	// Parse column list
+	// Parse column list — supports column names and expressions like (UPPER(name))
 	for {
 		col := ast.IndexColumn{}
-		if !p.isIdentifier() {
-			return nil, p.expectedError("column name")
+
+		if p.isType(models.TokenTypeLParen) {
+			// Functional index: ((expression))
+			// Skip the expression by tracking paren depth
+			depth := 0
+			var exprParts []string
+			for {
+				if p.isType(models.TokenTypeLParen) {
+					depth++
+				} else if p.isType(models.TokenTypeRParen) {
+					depth--
+					if depth == 0 {
+						p.advance() // Consume final )
+						break
+					}
+				}
+				exprParts = append(exprParts, p.currentToken.Token.Value)
+				p.advance()
+			}
+			col.Column = "(" + joinTokens(exprParts) + ")"
+		} else if p.isIdentifier() {
+			col.Column = p.currentToken.Token.Value
+			p.advance()
+		} else {
+			return nil, p.expectedError("column name or expression")
 		}
-		col.Column = p.currentToken.Token.Value
-		p.advance()
+
+		// Parse optional prefix length: col(10)
+		if p.isType(models.TokenTypeLParen) {
+			p.advance()
+			if p.isNumericLiteral() {
+				p.advance()
+			}
+			if p.isType(models.TokenTypeRParen) {
+				p.advance()
+			}
+		}
 
 		// Parse optional direction
 		if p.isType(models.TokenTypeAsc) {
@@ -96,7 +128,7 @@ func (p *Parser) parseCreateIndex(unique bool) (*ast.CreateIndexStatement, error
 			p.advance()
 		}
 
-		// Parse optional NULLS LAST
+		// Parse optional NULLS LAST/FIRST
 		if p.isType(models.TokenTypeNulls) {
 			p.advance() // Consume NULLS
 			if p.isType(models.TokenTypeLast) {
@@ -122,7 +154,25 @@ func (p *Parser) parseCreateIndex(unique bool) (*ast.CreateIndexStatement, error
 	}
 	p.advance() // Consume )
 
-	// Parse optional WHERE clause (partial index)
+	// Parse optional INVISIBLE/VISIBLE (MySQL 8.0)
+	if p.isTokenMatch("INVISIBLE") || p.isTokenMatch("VISIBLE") {
+		p.advance()
+	}
+
+	// Parse optional ALGORITHM/LOCK (MySQL online DDL)
+	for p.isTokenMatch("ALGORITHM") || p.isTokenMatch("LOCK") {
+		p.advance() // keyword
+		if p.isType(models.TokenTypeEq) {
+			p.advance() // =
+		}
+		if p.isIdentifier() || p.isTokenMatch("NONE") || p.isTokenMatch("SHARED") ||
+			p.isTokenMatch("EXCLUSIVE") || p.isTokenMatch("DEFAULT") ||
+			p.isTokenMatch("INPLACE") || p.isTokenMatch("COPY") || p.isTokenMatch("INSTANT") {
+			p.advance()
+		}
+	}
+
+	// Parse optional WHERE clause (partial index - PostgreSQL)
 	if p.isType(models.TokenTypeWhere) {
 		p.advance() // Consume WHERE
 		whereClause, err := p.parseExpression()
@@ -133,4 +183,16 @@ func (p *Parser) parseCreateIndex(unique bool) (*ast.CreateIndexStatement, error
 	}
 
 	return stmt, nil
+}
+
+// joinTokens joins token values with spaces
+func joinTokens(parts []string) string {
+	result := ""
+	for i, p := range parts {
+		if i > 0 {
+			result += " "
+		}
+		result += p
+	}
+	return result
 }

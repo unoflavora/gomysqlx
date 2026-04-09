@@ -71,22 +71,30 @@ func (p *Parser) parseColumnDef() (*ast.ColumnDef, error) {
 
 	dataTypeStr := dataType.Name
 
-	// Check for type parameters like VARCHAR(100) or DECIMAL(10,2)
+	// Check for type parameters like VARCHAR(100), DECIMAL(10,2), ENUM('a','b','c')
 	if p.isType(models.TokenTypeLParen) {
 		dataTypeStr += "("
 		p.advance() // Consume (
 
-		// Parse first parameter (can be number or identifier like MAX)
-		if p.isType(models.TokenTypeNumber) || p.isType(models.TokenTypeIdentifier) {
-			dataTypeStr += p.currentToken.Token.Value
-			p.advance()
-		}
-
-		// Check for second parameter (e.g., DECIMAL(10,2))
-		if p.isType(models.TokenTypeComma) {
-			dataTypeStr += ","
-			p.advance()
+		// Parse parameters — handle strings (for ENUM/SET), numbers, identifiers
+		first := true
+		for !p.isType(models.TokenTypeRParen) && !p.isType(models.TokenTypeEOF) {
+			if !first {
+				if p.isType(models.TokenTypeComma) {
+					dataTypeStr += ","
+					p.advance()
+				} else {
+					break
+				}
+			}
+			first = false
 			if p.isType(models.TokenTypeNumber) || p.isType(models.TokenTypeIdentifier) {
+				dataTypeStr += p.currentToken.Token.Value
+				p.advance()
+			} else if p.isStringLiteral() {
+				dataTypeStr += "'" + p.currentToken.Token.Value + "'"
+				p.advance()
+			} else {
 				dataTypeStr += p.currentToken.Token.Value
 				p.advance()
 			}
@@ -97,6 +105,17 @@ func (p *Parser) parseColumnDef() (*ast.ColumnDef, error) {
 		}
 		dataTypeStr += ")"
 		p.advance() // Consume )
+	}
+
+	// MySQL UNSIGNED modifier: BIGINT UNSIGNED, INT UNSIGNED
+	if p.isTokenMatch("UNSIGNED") {
+		dataTypeStr += " UNSIGNED"
+		p.advance()
+	}
+	// MySQL ZEROFILL modifier
+	if p.isTokenMatch("ZEROFILL") {
+		dataTypeStr += " ZEROFILL"
+		p.advance()
 	}
 
 	colDef := &ast.ColumnDef{
@@ -244,6 +263,126 @@ func (p *Parser) parseColumnConstraint() (*ast.ColumnConstraint, bool, error) {
 		p.advance() // Consume AUTO_INCREMENT
 		constraint.Type = "AUTO_INCREMENT"
 		constraint.AutoIncrement = true
+		return constraint, true, nil
+	}
+
+	// ON UPDATE CURRENT_TIMESTAMP (MySQL timestamp columns)
+	if p.isType(models.TokenTypeOn) && p.peekToken().Token.Type == models.TokenTypeUpdate {
+		p.advance() // Consume ON
+		p.advance() // Consume UPDATE
+		constraint.Type = "ON UPDATE"
+		// Parse the expression (e.g., CURRENT_TIMESTAMP, NOW())
+		expr, err := p.parseExpression()
+		if err != nil {
+			return nil, false, err
+		}
+		constraint.Default = expr
+		return constraint, true, nil
+	}
+
+	// COLLATE (MySQL column-level collation)
+	if p.isType(models.TokenTypeCollate) || p.isTokenMatch("COLLATE") {
+		p.advance() // Consume COLLATE
+		constraint.Type = "COLLATE"
+		if p.isIdentifier() || p.isType(models.TokenTypeString) {
+			constraint.Default = &ast.LiteralValue{Value: p.currentToken.Token.Value, Type: "string"}
+			p.advance()
+		}
+		return constraint, true, nil
+	}
+
+	// COMMENT (MySQL column comment)
+	if p.isTokenMatch("COMMENT") {
+		p.advance() // Consume COMMENT
+		constraint.Type = "COMMENT"
+		if p.isStringLiteral() {
+			constraint.Default = &ast.LiteralValue{Value: p.currentToken.Token.Value, Type: "string"}
+			p.advance()
+		}
+		return constraint, true, nil
+	}
+
+	// INVISIBLE / VISIBLE (MySQL 8.0.23+)
+	if p.isTokenMatch("INVISIBLE") {
+		p.advance()
+		constraint.Type = "INVISIBLE"
+		return constraint, true, nil
+	}
+	if p.isTokenMatch("VISIBLE") {
+		p.advance()
+		constraint.Type = "VISIBLE"
+		return constraint, true, nil
+	}
+
+	// GENERATED ALWAYS AS (expr) [VIRTUAL|STORED] (MySQL generated columns)
+	if p.isTokenMatch("GENERATED") {
+		p.advance() // Consume GENERATED
+		if p.isTokenMatch("ALWAYS") {
+			p.advance() // Consume ALWAYS
+		}
+		if !p.isType(models.TokenTypeAs) {
+			return nil, false, p.expectedError("AS after GENERATED ALWAYS")
+		}
+		p.advance() // Consume AS
+		if !p.isType(models.TokenTypeLParen) {
+			return nil, false, p.expectedError("( after AS")
+		}
+		p.advance() // Consume (
+		expr, err := p.parseExpression()
+		if err != nil {
+			return nil, false, err
+		}
+		if !p.isType(models.TokenTypeRParen) {
+			return nil, false, p.expectedError(")")
+		}
+		p.advance() // Consume )
+		constraint.Type = "GENERATED"
+		constraint.Default = expr
+		// Optional VIRTUAL or STORED
+		if p.isTokenMatch("VIRTUAL") || p.isTokenMatch("STORED") {
+			p.advance()
+		}
+		return constraint, true, nil
+	}
+
+	// AS (expr) shorthand for generated columns
+	if p.isType(models.TokenTypeAs) {
+		p.advance() // Consume AS
+		if !p.isType(models.TokenTypeLParen) {
+			return nil, false, p.expectedError("( after AS")
+		}
+		p.advance()
+		expr, err := p.parseExpression()
+		if err != nil {
+			return nil, false, err
+		}
+		if !p.isType(models.TokenTypeRParen) {
+			return nil, false, p.expectedError(")")
+		}
+		p.advance()
+		constraint.Type = "GENERATED"
+		constraint.Default = expr
+		if p.isTokenMatch("VIRTUAL") || p.isTokenMatch("STORED") {
+			p.advance()
+		}
+		return constraint, true, nil
+	}
+
+	// AFTER column_name (MySQL ADD COLUMN position — consumed here so it doesn't break constraint loop)
+	if p.isTokenMatch("AFTER") {
+		p.advance() // Consume AFTER
+		constraint.Type = "AFTER"
+		if p.isIdentifier() {
+			constraint.Default = &ast.Identifier{Name: p.currentToken.Token.Value}
+			p.advance()
+		}
+		return constraint, true, nil
+	}
+
+	// FIRST (MySQL ADD COLUMN position)
+	if p.isTokenMatch("FIRST") {
+		p.advance()
+		constraint.Type = "FIRST"
 		return constraint, true, nil
 	}
 

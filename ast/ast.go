@@ -1274,7 +1274,8 @@ type CreateTableStatement struct {
 	PartitionBy  *PartitionBy
 	Partitions   []PartitionDefinition // Individual partition definitions
 	Options      []TableOption
-	WithoutRowID bool // SQLite: CREATE TABLE ... WITHOUT ROWID
+	WithoutRowID bool   // SQLite: CREATE TABLE ... WITHOUT ROWID
+	LikeTable    string // MySQL: CREATE TABLE ... LIKE other_table
 }
 
 func (c *CreateTableStatement) statementNode()      {}

@@ -77,13 +77,25 @@ func (p *Parser) parseCreateStatement() (ast.Statement, error) {
 		return p.parseCreateIndex(false) // Not unique
 	} else if p.isType(models.TokenTypeUnique) {
 		p.advance() // Consume UNIQUE
-		if !p.isType(models.TokenTypeIndex) {
+		if !p.isType(models.TokenTypeIndex) && !p.isType(models.TokenTypeKey) {
 			return nil, p.expectedError("INDEX after UNIQUE")
 		}
-		p.advance()                     // Consume INDEX
+		p.advance()                     // Consume INDEX/KEY
 		return p.parseCreateIndex(true) // Unique
+	} else if p.isTokenMatch("FULLTEXT") {
+		p.advance() // Consume FULLTEXT
+		if p.isType(models.TokenTypeIndex) || p.isType(models.TokenTypeKey) {
+			p.advance() // Consume INDEX/KEY
+		}
+		return p.parseCreateIndex(false)
+	} else if p.isTokenMatch("SPATIAL") {
+		p.advance() // Consume SPATIAL
+		if p.isType(models.TokenTypeIndex) || p.isType(models.TokenTypeKey) {
+			p.advance() // Consume INDEX/KEY
+		}
+		return p.parseCreateIndex(false)
 	}
-	return nil, p.expectedError("TABLE, VIEW, MATERIALIZED VIEW, or INDEX after CREATE")
+	return nil, p.expectedError("TABLE, VIEW, MATERIALIZED VIEW, INDEX, UNIQUE INDEX, FULLTEXT INDEX, or SPATIAL INDEX after CREATE")
 }
 
 // parseCreateTable parses CREATE TABLE statement with partitioning support
@@ -112,6 +124,32 @@ func (p *Parser) parseCreateTable(temporary bool) (*ast.CreateTableStatement, er
 		return nil, p.expectedError("table name")
 	}
 	stmt.Name = createTableName
+
+	// CREATE TABLE ... LIKE other_table
+	if p.isType(models.TokenTypeLike) || p.isTokenMatch("LIKE") {
+		p.advance() // Consume LIKE
+		likeTable, err := p.parseQualifiedName()
+		if err != nil {
+			return nil, p.expectedError("table name after LIKE")
+		}
+		stmt.LikeTable = likeTable
+		return stmt, nil
+	}
+
+	// CREATE TABLE ... AS SELECT ...
+	if p.isType(models.TokenTypeAs) {
+		p.advance() // Consume AS
+		if p.isType(models.TokenTypeSelect) || p.isType(models.TokenTypeWith) {
+			p.advance() // Consume SELECT/WITH
+			query, err := p.parseSelectWithSetOperations()
+			if err != nil {
+				return nil, err
+			}
+			_ = query // We parse it but don't store in AST (table extraction happens via AST walk)
+			return stmt, nil
+		}
+		return nil, p.expectedError("SELECT after AS")
+	}
 
 	// Expect opening parenthesis for column definitions
 	if !p.isType(models.TokenTypeLParen) {
@@ -189,15 +227,64 @@ func (p *Parser) parseCreateTable(temporary bool) (*ast.CreateTableStatement, er
 		}
 	}
 
-	// Parse optional table options
-	for p.isTokenMatch("ENGINE") || p.isTokenMatch("CHARSET") ||
-		p.isType(models.TokenTypeCollate) || p.isTokenMatch("COMMENT") {
-		opt := ast.TableOption{Name: p.currentToken.Token.Value}
-		p.advance()
+	// Parse optional table options — handle all MySQL table options
+	for {
+		// DEFAULT is a prefix for CHARSET/CHARACTER SET/COLLATE
+		if p.isType(models.TokenTypeDefault) || p.isTokenMatch("DEFAULT") {
+			p.advance() // Consume DEFAULT
+			// Fall through to parse the actual option below
+		}
+
+		optName := strings.ToUpper(p.currentToken.Token.Value)
+		isTableOpt := false
+		switch {
+		case optName == "ENGINE":
+			isTableOpt = true
+		case optName == "CHARSET" || optName == "CHARACTER":
+			isTableOpt = true
+			if optName == "CHARACTER" {
+				p.advance() // Consume CHARACTER
+				if p.isType(models.TokenTypeSet) || p.isTokenMatch("SET") {
+					optName = "CHARACTER SET"
+				}
+			}
+		case p.isType(models.TokenTypeCollate) || optName == "COLLATE":
+			isTableOpt = true
+			optName = "COLLATE"
+		case optName == "COMMENT":
+			isTableOpt = true
+		case optName == "AUTO_INCREMENT" || p.isType(models.TokenTypeAutoIncrement):
+			isTableOpt = true
+			optName = "AUTO_INCREMENT"
+		case optName == "ROW_FORMAT":
+			isTableOpt = true
+		case optName == "PARTITIONS":
+			isTableOpt = true
+		case optName == "KEY_BLOCK_SIZE":
+			isTableOpt = true
+		case optName == "PACK_KEYS":
+			isTableOpt = true
+		case optName == "STATS_AUTO_RECALC":
+			isTableOpt = true
+		case optName == "STATS_PERSISTENT":
+			isTableOpt = true
+		case optName == "COMPRESSION":
+			isTableOpt = true
+		case optName == "TABLESPACE":
+			isTableOpt = true
+		}
+
+		if !isTableOpt {
+			break
+		}
+
+		opt := ast.TableOption{Name: optName}
+		p.advance() // Consume option name
 		if p.isType(models.TokenTypeEq) {
 			p.advance() // Consume =
 		}
-		if p.isIdentifier() || p.isType(models.TokenTypeString) {
+		// Parse value: can be identifier, string, or number
+		if p.isIdentifier() || p.isType(models.TokenTypeString) || p.isNumericLiteral() || p.isStringLiteral() {
 			opt.Value = p.currentToken.Token.Value
 			p.advance()
 		}
@@ -235,32 +322,45 @@ func (p *Parser) parsePartitionByClause() (*ast.PartitionBy, error) {
 		return nil, p.expectedError("RANGE, LIST, or HASH")
 	}
 
-	// Expect opening parenthesis
+	// Expect opening parenthesis — content can be expression like YEAR(sale_date)
 	if !p.isType(models.TokenTypeLParen) {
 		return nil, p.expectedError("(")
 	}
 	p.advance() // Consume (
 
-	// Parse column list
-	for {
-		if !p.isIdentifier() {
-			return nil, p.expectedError("column name")
+	// Parse expression(s) inside PARTITION BY (...)
+	// This handles both simple column names and expressions like YEAR(sale_date)
+	depth := 1
+	var exprTokens []string
+	for depth > 0 && !p.isType(models.TokenTypeEOF) {
+		if p.isType(models.TokenTypeLParen) {
+			depth++
+		} else if p.isType(models.TokenTypeRParen) {
+			depth--
+			if depth == 0 {
+				break
+			}
 		}
-		partitionBy.Columns = append(partitionBy.Columns, p.currentToken.Token.Value)
+		// Collect column names at depth 1 for the Columns field
+		if depth == 1 && p.isIdentifier() {
+			partitionBy.Columns = append(partitionBy.Columns, p.currentToken.Token.Value)
+		}
+		exprTokens = append(exprTokens, p.currentToken.Token.Value)
 		p.advance()
-
-		if p.isType(models.TokenTypeComma) {
-			p.advance() // Consume comma
-			continue
-		}
-		break
 	}
 
-	// Expect closing parenthesis
 	if !p.isType(models.TokenTypeRParen) {
 		return nil, p.expectedError(")")
 	}
 	p.advance() // Consume )
+
+	// Handle PARTITIONS N (for HASH/KEY)
+	if p.isTokenMatch("PARTITIONS") {
+		p.advance() // Consume PARTITIONS
+		if p.isNumericLiteral() {
+			p.advance() // Consume number
+		}
+	}
 
 	return partitionBy, nil
 }

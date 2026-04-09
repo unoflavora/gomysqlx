@@ -859,19 +859,19 @@ func TestParser_ErrorRecovery_ALTER(t *testing.T) {
 				// Missing ADD/DROP/RENAME/ALTER
 			},
 			wantErr:       true,
-			errorContains: "ADD, DROP, RENAME, or ALTER",
+			errorContains: "ALTER TABLE operation",
 		},
 		{
-			name: "missing COLUMN or CONSTRAINT after ADD",
+			name: "ADD without COLUMN keyword is valid MySQL",
 			tokens: []token.Token{
 				{Type: models.TokenTypeAlter, Literal: "ALTER"},
 				{Type: models.TokenTypeTable, Literal: "TABLE"},
 				{Type: models.TokenTypeIdentifier, Literal: "users"},
 				{Type: models.TokenTypeAdd, Literal: "ADD"},
-				{Type: models.TokenTypeIdentifier, Literal: "email"}, // Missing COLUMN/CONSTRAINT keyword
+				{Type: models.TokenTypeIdentifier, Literal: "email"}, // Valid: ADD col_name type (COLUMN keyword optional in MySQL)
 			},
 			wantErr:       true,
-			errorContains: "COLUMN or CONSTRAINT",
+			errorContains: "data type", // fails because no data type follows the column name
 		},
 		{
 			name: "missing column definition after ADD COLUMN",
@@ -900,28 +900,26 @@ func TestParser_ErrorRecovery_ALTER(t *testing.T) {
 			errorContains: "constraint name",
 		},
 		{
-			name: "missing COLUMN or CONSTRAINT after DROP",
+			name: "DROP without COLUMN keyword is valid MySQL",
 			tokens: []token.Token{
 				{Type: models.TokenTypeAlter, Literal: "ALTER"},
 				{Type: models.TokenTypeTable, Literal: "TABLE"},
 				{Type: models.TokenTypeIdentifier, Literal: "users"},
 				{Type: models.TokenTypeDrop, Literal: "DROP"},
-				{Type: models.TokenTypeIdentifier, Literal: "email"}, // Missing COLUMN/CONSTRAINT keyword
+				{Type: models.TokenTypeIdentifier, Literal: "email"}, // Valid: DROP col_name (COLUMN keyword optional in MySQL)
 			},
-			wantErr:       true,
-			errorContains: "COLUMN or CONSTRAINT",
+			wantErr: false, // Now valid — DROP column_name without COLUMN keyword
 		},
 		{
-			name: "missing TO or COLUMN after RENAME",
+			name: "RENAME without TO is valid MySQL",
 			tokens: []token.Token{
 				{Type: models.TokenTypeAlter, Literal: "ALTER"},
 				{Type: models.TokenTypeTable, Literal: "TABLE"},
 				{Type: models.TokenTypeIdentifier, Literal: "users"},
 				{Type: models.TokenTypeRename, Literal: "RENAME"},
-				{Type: models.TokenTypeIdentifier, Literal: "new_name"}, // Missing TO or COLUMN
+				{Type: models.TokenTypeIdentifier, Literal: "new_name"}, // Valid: RENAME new_name (TO is optional)
 			},
-			wantErr:       true,
-			errorContains: "TO or COLUMN",
+			wantErr: false, // Now valid — RENAME table_name without TO keyword
 		},
 		{
 			name: "missing TO keyword in RENAME COLUMN",

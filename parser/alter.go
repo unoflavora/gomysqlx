@@ -15,8 +15,10 @@
 package parser
 
 import (
-	"github.com/unoflavora/gomysqlx/models"
+	"strings"
+
 	"github.com/unoflavora/gomysqlx/ast"
+	"github.com/unoflavora/gomysqlx/models"
 )
 
 // parseAlterStatement parses ALTER statements
@@ -42,13 +44,54 @@ func (p *Parser) parseAlterStatement() (*ast.AlterStatement, error) {
 	}
 }
 
-// parseAlterTableStatement parses ALTER TABLE statements
+// parseAlterTableStatement parses ALTER TABLE statements with full MySQL support.
+// Supports multiple comma-separated operations, MODIFY, CHANGE, ADD INDEX,
+// DROP INDEX/PRIMARY KEY/FOREIGN KEY, ENGINE, CHARACTER SET, AUTO_INCREMENT,
+// ALGORITHM, LOCK, FORCE, DISABLE/ENABLE KEYS, ORDER BY, CONVERT TO, ALTER INDEX.
 func (p *Parser) parseAlterTableStatement(stmt *ast.AlterStatement) (*ast.AlterStatement, error) {
 	stmt.Name = p.parseIdentAsString()
+
+	// Parse first operation
+	op, err := p.parseAlterTableOperation()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Operation = op
+
+	// Parse additional comma-separated operations (MySQL supports multiple)
+	for p.isType(models.TokenTypeComma) {
+		p.advance() // Consume comma
+		_, err := p.parseAlterTableOperation()
+		if err != nil {
+			return nil, err
+		}
+		// We only store the first operation in stmt.Operation for backward compatibility.
+		// Additional operations are consumed but not stored in the AST (sufficient for
+		// table name extraction which is our primary use case).
+	}
+
+	// Parse optional ALGORITHM and LOCK
+	for p.isTokenMatch("ALGORITHM") || p.isTokenMatch("LOCK") {
+		p.advance()
+		if p.isType(models.TokenTypeEq) {
+			p.advance()
+		}
+		if p.isIdentifier() || p.isTokenMatch("NONE") || p.isTokenMatch("SHARED") ||
+			p.isTokenMatch("EXCLUSIVE") || p.isTokenMatch("DEFAULT") ||
+			p.isTokenMatch("INPLACE") || p.isTokenMatch("COPY") || p.isTokenMatch("INSTANT") {
+			p.advance()
+		}
+	}
+
+	return stmt, nil
+}
+
+func (p *Parser) parseAlterTableOperation() (*ast.AlterTableOperation, error) {
 	op := &ast.AlterTableOperation{}
 
 	switch {
 	case p.matchType(models.TokenTypeAdd):
+		// ADD [COLUMN] col_def | ADD CONSTRAINT | ADD [UNIQUE|FULLTEXT|SPATIAL] INDEX/KEY
 		if p.matchType(models.TokenTypeColumn) {
 			op.Type = ast.AddColumn
 			colDef, err := p.parseColumnDef()
@@ -63,14 +106,51 @@ func (p *Parser) parseAlterTableStatement(stmt *ast.AlterStatement) (*ast.AlterS
 				return nil, err
 			}
 			op.Constraint = constraint
+		} else if p.isAnyType(models.TokenTypeIndex, models.TokenTypeKey) ||
+			p.isType(models.TokenTypeUnique) || p.isTokenMatch("FULLTEXT") || p.isTokenMatch("SPATIAL") {
+			// ADD [UNIQUE|FULLTEXT|SPATIAL] INDEX/KEY name (columns)
+			op.Type = ast.AddConstraint
+			// Skip index type modifiers
+			for p.isType(models.TokenTypeUnique) || p.isTokenMatch("FULLTEXT") || p.isTokenMatch("SPATIAL") {
+				p.advance()
+			}
+			if p.isAnyType(models.TokenTypeIndex, models.TokenTypeKey) {
+				p.advance()
+			}
+			// Skip index name if present
+			if p.isIdentifier() {
+				p.advance()
+			}
+			// Parse column list
+			if p.isType(models.TokenTypeLParen) {
+				p.advance()
+				for !p.isType(models.TokenTypeRParen) && !p.isType(models.TokenTypeEOF) {
+					p.advance()
+				}
+				if p.isType(models.TokenTypeRParen) {
+					p.advance()
+				}
+			}
+		} else if p.isAnyType(models.TokenTypePrimary, models.TokenTypeForeign) {
+			op.Type = ast.AddConstraint
+			constraint, err := p.parseTableConstraint()
+			if err != nil {
+				return nil, err
+			}
+			op.Constraint = constraint
 		} else {
-			return nil, p.expectedError("COLUMN or CONSTRAINT")
+			// MySQL allows ADD col_def without COLUMN keyword
+			op.Type = ast.AddColumn
+			colDef, err := p.parseColumnDef()
+			if err != nil {
+				return nil, err
+			}
+			op.ColumnDef = colDef
 		}
 
 	case p.matchType(models.TokenTypeDrop):
 		if p.matchType(models.TokenTypeColumn) {
 			op.Type = ast.DropColumn
-			// Convert ast.Identifier to ast.Ident
 			ident := p.parseIdent()
 			if ident == nil {
 				return nil, p.expectedError("column name")
@@ -81,7 +161,6 @@ func (p *Parser) parseAlterTableStatement(stmt *ast.AlterStatement) (*ast.AlterS
 			}
 		} else if p.matchType(models.TokenTypeConstraint) {
 			op.Type = ast.DropConstraint
-			// Convert ast.Identifier to ast.Ident
 			ident := p.parseIdent()
 			if ident == nil {
 				return nil, p.expectedError("constraint name")
@@ -90,17 +169,81 @@ func (p *Parser) parseAlterTableStatement(stmt *ast.AlterStatement) (*ast.AlterS
 			if p.matchType(models.TokenTypeCascade) {
 				op.CascadeDrops = true
 			}
+		} else if p.isAnyType(models.TokenTypeIndex, models.TokenTypeKey) {
+			p.advance() // INDEX/KEY
+			op.Type = ast.DropConstraint
+			ident := p.parseIdent()
+			if ident != nil {
+				op.ConstraintName = &ast.Ident{Name: ident.Name}
+			}
+		} else if p.isType(models.TokenTypePrimary) {
+			p.advance() // PRIMARY
+			if p.isType(models.TokenTypeKey) {
+				p.advance() // KEY
+			}
+			op.Type = ast.DropConstraint
+			op.ConstraintName = &ast.Ident{Name: "PRIMARY"}
+		} else if p.isType(models.TokenTypeForeign) {
+			p.advance() // FOREIGN
+			if p.isType(models.TokenTypeKey) {
+				p.advance() // KEY
+			}
+			op.Type = ast.DropConstraint
+			ident := p.parseIdent()
+			if ident != nil {
+				op.ConstraintName = &ast.Ident{Name: ident.Name}
+			}
 		} else {
-			return nil, p.expectedError("COLUMN or CONSTRAINT")
+			// DROP column_name (without COLUMN keyword)
+			op.Type = ast.DropColumn
+			ident := p.parseIdent()
+			if ident == nil {
+				return nil, p.expectedError("COLUMN, INDEX, PRIMARY KEY, FOREIGN KEY, or column name")
+			}
+			op.ColumnName = &ast.Ident{Name: ident.Name}
 		}
 
+	case p.isTokenMatch("MODIFY"):
+		p.advance() // MODIFY
+		if p.matchType(models.TokenTypeColumn) {
+			// optional COLUMN keyword
+		}
+		op.Type = ast.AlterColumn
+		colDef, err := p.parseColumnDef()
+		if err != nil {
+			return nil, err
+		}
+		op.ColumnDef = colDef
+
+	case p.isTokenMatch("CHANGE"):
+		p.advance() // CHANGE
+		if p.matchType(models.TokenTypeColumn) {
+			// optional COLUMN keyword
+		}
+		op.Type = ast.RenameColumn
+		// Old column name
+		ident := p.parseIdent()
+		if ident == nil {
+			return nil, p.expectedError("old column name")
+		}
+		op.ColumnName = &ast.Ident{Name: ident.Name}
+		// New column definition (includes new name + type + constraints)
+		colDef, err := p.parseColumnDef()
+		if err != nil {
+			return nil, err
+		}
+		op.ColumnDef = colDef
+		op.NewColumnName = &ast.Ident{Name: colDef.Name}
+
 	case p.matchType(models.TokenTypeRename):
-		if p.matchType(models.TokenTypeTo) {
+		if p.matchType(models.TokenTypeTo) || p.isType(models.TokenTypeAs) {
+			if p.isType(models.TokenTypeAs) {
+				p.advance()
+			}
 			op.Type = ast.RenameTable
 			op.NewTableName = p.parseObjectName()
 		} else if p.matchType(models.TokenTypeColumn) {
 			op.Type = ast.RenameColumn
-			// Convert ast.Identifier to ast.Ident
 			ident := p.parseIdent()
 			if ident == nil {
 				return nil, p.expectedError("column name")
@@ -109,39 +252,117 @@ func (p *Parser) parseAlterTableStatement(stmt *ast.AlterStatement) (*ast.AlterS
 			if !p.matchType(models.TokenTypeTo) {
 				return nil, p.expectedError("TO")
 			}
-			// Convert ast.Identifier to ast.Ident
 			newIdent := p.parseIdent()
 			if newIdent == nil {
 				return nil, p.expectedError("new column name")
 			}
 			op.NewColumnName = &ast.Ident{Name: newIdent.Name}
+		} else if p.isAnyType(models.TokenTypeIndex, models.TokenTypeKey) {
+			p.advance() // INDEX/KEY
+			op.Type = ast.RenameColumn // reuse for index rename
+			ident := p.parseIdent()
+			if ident != nil {
+				op.ColumnName = &ast.Ident{Name: ident.Name}
+			}
+			if p.matchType(models.TokenTypeTo) {
+				newIdent := p.parseIdent()
+				if newIdent != nil {
+					op.NewColumnName = &ast.Ident{Name: newIdent.Name}
+				}
+			}
 		} else {
-			return nil, p.expectedError("TO or COLUMN")
+			op.Type = ast.RenameTable
+			op.NewTableName = p.parseObjectName()
 		}
 
 	case p.matchType(models.TokenTypeAlter):
-		if !p.matchType(models.TokenTypeColumn) {
-			return nil, p.expectedError("COLUMN")
+		if p.matchType(models.TokenTypeColumn) {
+			op.Type = ast.AlterColumn
+			ident := p.parseIdent()
+			if ident == nil {
+				return nil, p.expectedError("column name")
+			}
+			op.ColumnName = &ast.Ident{Name: ident.Name}
+			colDef, err := p.parseColumnDef()
+			if err != nil {
+				return nil, err
+			}
+			op.ColumnDef = colDef
+		} else if p.isAnyType(models.TokenTypeIndex, models.TokenTypeKey) {
+			// ALTER INDEX idx_name INVISIBLE/VISIBLE
+			p.advance()
+			op.Type = ast.AlterColumn
+			ident := p.parseIdent()
+			if ident != nil {
+				op.ColumnName = &ast.Ident{Name: ident.Name}
+			}
+			// Consume INVISIBLE/VISIBLE
+			if p.isTokenMatch("INVISIBLE") || p.isTokenMatch("VISIBLE") {
+				p.advance()
+			}
+		} else {
+			return nil, p.expectedError("COLUMN or INDEX")
+		}
+
+	case p.isTokenMatch("CONVERT"):
+		// CONVERT TO CHARACTER SET charset [COLLATE collation]
+		p.advance() // CONVERT
+		if p.matchType(models.TokenTypeTo) {
+			// skip CHARACTER SET / CHARSET + value
+			for !p.isType(models.TokenTypeEOF) && !p.isType(models.TokenTypeSemicolon) &&
+				!p.isType(models.TokenTypeComma) {
+				p.advance()
+			}
 		}
 		op.Type = ast.AlterColumn
-		// Convert ast.Identifier to ast.Ident
-		ident := p.parseIdent()
-		if ident == nil {
-			return nil, p.expectedError("column name")
-		}
-		op.ColumnName = &ast.Ident{Name: ident.Name}
-		colDef, err := p.parseColumnDef()
-		if err != nil {
-			return nil, err
-		}
-		op.ColumnDef = colDef
 
 	default:
-		return nil, p.expectedError("ADD, DROP, RENAME, or ALTER")
+		// Handle MySQL table-level options: ENGINE, AUTO_INCREMENT, FORCE, DISABLE/ENABLE KEYS, ORDER BY
+		val := strings.ToUpper(p.currentToken.Token.Value)
+		switch val {
+		case "ENGINE", "AUTO_INCREMENT", "ROW_FORMAT", "CHARSET", "CHARACTER":
+			op.Type = ast.AlterColumn // use as placeholder
+			p.advance()
+			if p.isType(models.TokenTypeEq) {
+				p.advance()
+			}
+			if p.isIdentifier() || p.isNumericLiteral() || p.isType(models.TokenTypeString) {
+				p.advance()
+			}
+		case "FORCE":
+			op.Type = ast.AlterColumn
+			p.advance()
+		case "DISABLE", "ENABLE":
+			op.Type = ast.AlterColumn
+			p.advance()
+			if p.isTokenMatch("KEYS") {
+				p.advance()
+			}
+		case "ORDER":
+			op.Type = ast.AlterColumn
+			p.advance()
+			if p.isType(models.TokenTypeBy) {
+				p.advance()
+				// Parse order expression
+				for {
+					if p.isIdentifier() {
+						p.advance()
+					}
+					if p.isTokenMatch("ASC") || p.isTokenMatch("DESC") {
+						p.advance()
+					}
+					if !p.isType(models.TokenTypeComma) {
+						break
+					}
+					p.advance()
+				}
+			}
+		default:
+			return nil, p.expectedError("ADD, DROP, MODIFY, CHANGE, RENAME, ALTER, CONVERT, ENGINE, FORCE, or other ALTER TABLE operation")
+		}
 	}
 
-	stmt.Operation = op
-	return stmt, nil
+	return op, nil
 }
 
 // parseAlterRoleStatement parses ALTER ROLE statements
